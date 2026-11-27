@@ -1,6 +1,29 @@
 # 麦来 · YapDash
 
-Windows 开黑语音弹幕。它监听你选中的应用，在本机转写队友语音。命中关键词时，屏幕上显示识别到的整句话。比如词库有「牢赛」，队友说「东楼有牢赛」，弹幕就显示「东楼有牢赛」。
+![麦来 · YapDash 开黑语音弹幕海报，游戏画面上浮出「右边有脚步」](readme-poster.png)
+
+枪声盖住了队友报点？麦来把 KOOK 或 Oopz 里的关键语音变成游戏画面上的整句弹幕。错过了还可以按 `Ctrl+Shift+F9` 重看上一句。
+
+## 下载麦来
+
+- **Windows 安装版** · 下载后双击安装，可创建桌面快捷方式，也可从 Windows 设置卸载。安装程序暂未签名。[下载安装程序](https://github.com/JasonZhangOR/YapDash/releases/download/v1.0.0/YapDash-Setup.exe)
+- **Windows 免安装版** · 完整解压后双击 `麦来.exe`。[下载免安装 ZIP](https://github.com/JasonZhangOR/YapDash/releases/download/v1.0.0/YapDash-Portable.zip)
+- **源码版** · 适合想查看代码或自行构建的用户。解压后按下方「从源码启动」操作。[下载源码 ZIP](https://github.com/JasonZhangOR/YapDash/archive/refs/tags/v1.0.0.zip)
+
+安装版和免安装版均面向 64 位 Windows 11，内含运行环境和语音模型。
+
+| 你在玩 | 麦来可以抓什么 |
+| --- | --- |
+| 三角洲行动 | 「东楼有牢赛」「有人堵桥」 |
+| CS2 | 「香蕉道有两个」「下默认包」 |
+| 瓦洛兰特 | 「爆能器掉在中路」「已经拆了一半」 |
+| 明日方舟 · 卫戍协议 | 「先锁店，下回合三连」「这波帮我联防」 |
+
+在首页选「监听词库」就能切换。三角洲行动、CS2 和瓦洛兰特也支持按游戏进程自动切换。你可以加自己的报点和队内黑话。语音转写在 Windows 本机完成。
+
+日常开黑用默认的**纯净模式**，只看整句弹幕。想玩点花样，切到**娱乐模式**，给朋友的口头禅配上漫画字和贴纸，还有更多隐藏内容。
+
+[查看长版产品海报 · 把开黑聊天变成弹幕](product-poster-voice-chat.png)
 
 ![麦来 · YapDash 客户端首页](home.png)
 
@@ -13,6 +36,10 @@ Windows 开黑语音弹幕。它监听你选中的应用，在本机转写队友
 - 「调试模式」在窗口右侧显示原始转写、纠正结果和关键词命中状态，可以开启默认麦克风自行测试。
 - 可以选开整句原声回放。语音和昵称校准图像在本机处理，回放只在内存中短暂缓冲。
 - 朋友可用建议链接提交词条与特效改动，由词库主人审核。限时共编需要手动授权，到期失效。
+
+## Windows 安装
+
+双击 `YapDash-Setup.exe`，选择是否创建桌面快捷方式，点「安装」。安装包已经包含运行环境和语音模型，安装后可从开始菜单打开麦来。需要卸载时，在 Windows「已安装的应用」里找到「麦来 · YapDash」。词库和设置会保留。
 
 ## 从源码启动
 
@@ -35,7 +62,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\安装依赖和模型
 
 1. 打开 KOOK 或 Oopz，进入语音房。
 2. 在「设置 → 音频与诊断」选择对应应用，再回首页点击「开始监听」。
-3. 打开「设置 → 词包与试用」，选择游戏，点「合并到我的词库」，再点试播查看整句弹幕。也可在「设置 → 关键词」添加自己的说法。
+3. 在首页的「监听词库」选游戏，或选择「自动识别游戏」。想先看效果，可打开「设置 → 词包与试用」试播整句。
 4. 如需分享，到「设置 → 共享」生成建议链接。异地访问可选 [Cloudflare Quick Tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/) 或自己的 HTTPS 反向代理。使用 Quick Tunnel 时，把官方 Windows 版 `cloudflared.exe` 放在项目旁或加入 PATH。
 
 常用快捷键为 `Ctrl+Shift+F9` 重看上一句、`Ctrl+Shift+F10` 关闭整蛊并清屏，以及 `Ctrl+Shift+F8` 在娱乐模式试播「区」。游戏叠加可先用无边框窗口模式测试。
