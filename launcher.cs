@@ -19,7 +19,7 @@ internal static class Launcher
             if (python == null || !File.Exists(launcher))
             {
                 throw new InvalidOperationException(
-                    "Keep the extracted files together and install Python 3.10–3.12.");
+                    "Keep the extracted files together and install Python 3.9–3.12.");
             }
 
             using (Process.Start(new ProcessStartInfo(python, "\"" + launcher + "\"")
@@ -39,6 +39,11 @@ internal static class Launcher
 
     private static string FindPython(string folder)
     {
+        string bundled = Path.Combine(folder, @"runtime\pythonw.exe");
+        if (File.Exists(bundled))
+        {
+            return bundled;
+        }
         string local = Path.Combine(folder, @".venv\Scripts\pythonw.exe");
         if (File.Exists(local))
         {

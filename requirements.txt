@@ -1,2 +1,4 @@
 PyQt5>=5.15.11,<6
-vosk==0.3.45
+sherpa-onnx>=1.12,<2
+numpy>=1.26,<3
+pypinyin==0.55.0

@@ -19,11 +19,14 @@ from PyQt5 import QtCore as C, QtGui as G, QtWidgets as Q
 
 from sharing import Words, clean, serve
 from speakers import Activity, distance, fingerprint, is_active
-from replay import RecentAudio, VoiceReplay
+from replay import VoiceReplay
+from sensevoice import MODEL_DIR, MODEL_FILES, SenseVoice
 import delta_pack
+from phonetics import fold, match_words
 
 
 ROOT = Path(__file__).resolve().parent
+DEFAULT_MODEL = ROOT / "models" / MODEL_DIR
 DATA = Path(os.environ["LOCALAPPDATA"]) / "ShengMu"
 BRAND = "麦来 · YapDash"
 DEFAULT_DANMAKU_COLOR = "#fff28a"
@@ -33,9 +36,9 @@ POSITIONS = {"scroll": "从右往左", "top": "顶部正中", "bottom": "底部�
              "right": "右侧弹入", "left": "左侧弹入", "auto": "跟随语音方向"}
 DEFAULT_EFFECT = ["normal", 0, "区"]
 CUE_PATTERN = re.compile(r"左手边|左边|左侧|左面|右手边|右边|右侧|右面")
-REPEATED_DIRECTION = re.compile(r"(?P<call>左边|右边)(?P=call)*")
 BURST_WINDOW_SECONDS = 5.0
 MAX_BURST_CAPTIONS = 2
+DELTA_LATIN_NAMES = frozenset(word.casefold() for word in delta_pack.LATIN_NAMES)
 APP_STYLE = """
 QWidget#appWindow {background:#111116}
 QWidget {color:#efedf5}
@@ -59,6 +62,7 @@ QFrame#settingsRail {background:#18171f;border:1px solid #2c2937;border-radius:1
 QFrame#panelLine {background:#2e293d;max-height:1px}
 QFrame#statusDot {background:#736d84;border-radius:4px}
 QFrame#statusDot[active="true"] {background:#a7eac6}
+QPushButton#debugToggle:checked {background:#44345e;border:1px solid #78619c}
 QLineEdit,QPlainTextEdit,QListWidget,QComboBox,QSpinBox {
     background:#1c1b25;border:1px solid #373345;border-radius:8px;padding:8px;
     selection-background-color:#544077}
@@ -139,7 +143,7 @@ def running_processes():
             raise ctypes.WinError(ctypes.get_last_error())
         processes = []
         while True:
-            processes.append((entry.name, entry.pid))
+            processes.append((entry.name, entry.pid, entry.parent))
             if not kernel.Process32NextW(snapshot, ctypes.byref(entry)):
                 return processes
     finally:
@@ -183,7 +187,7 @@ class QuickStart(Q.QDialog):
          "先打开 KOOK 或 Oopz，进入语音房。在设置的「音频与诊断」里选择对应应用，"
          "回首页点「开始监听」。队友说话时，首页的音量条会动。"),
         ("决定哪些话要上屏",
-         "新词库已经带了 42 个三角洲关键词。在「设置 → 关键词」里可以增删或批量粘贴。"
+         f"新词库已经带了 {len(delta_pack.WORDS)} 个三角洲关键词。在「设置 → 关键词」里可以增删或批量粘贴。"
          "比如只配置「牢赛」，队友说「东楼有牢赛」，上屏的是整句话。"),
         ("自己试播一次",
          "下面的按钮可以直接试播整句，当前不用进语音房。娱乐模式下，在游戏里按 "
@@ -346,45 +350,38 @@ class Listener(C.QThread):
         self.stop = threading.Event()
         self.record_replay = threading.Event()
 
+    def audio_stream(self):
+        if self.pid is None:
+            from microphone import packets
+
+            yield from packets(self.stop, lambda: self.status.emit("正在读取麦克风"))
+            return
+        from capture import packets
+
+        rate_state = None
+        with closing(packets(self.pid, self.stop, lambda: self.status.emit("正在监听"))) as stream:
+            for stereo in stream:
+                mono = audioop.tomono(stereo, 2, 0.5, 0.5)
+                mono, rate_state = audioop.ratecv(mono, 2, 1, 44100, 16000, rate_state)
+                yield mono
+
     def run(self):
         try:
-            from vosk import Model, KaldiRecognizer, SetLogLevel
-            from capture import packets
-            SetLogLevel(-1)
-            # Vosk's Windows file loader can fail on a non-ASCII absolute path.
-            previous = Path.cwd()
-            try:
-                os.chdir(self.model_path)
-                model = Model(".")
-            finally:
-                os.chdir(previous)
-            recognizer = KaldiRecognizer(model, 16000)
-            recognizer.SetWords(True)
+            recognizer = SenseVoice(self.model_path)
             samples = 0
-            recent = RecentAudio()
-            rate_state = None
-            with closing(packets(
-                self.pid, self.stop, lambda: self.status.emit("正在监听"))) as stream:
-                for stereo in stream:
-                    mono = audioop.tomono(stereo, 2, 0.5, 0.5)
-                    mono, rate_state = audioop.ratecv(mono, 2, 1, 44100, 16000, rate_state)
+            if self.stop.is_set():
+                return
+            with closing(self.audio_stream()) as stream:
+                for mono in stream:
+                    if self.stop.is_set():
+                        break
                     samples += len(mono) // 2
-                    if self.record_replay.is_set():
-                        recent.add(samples, mono)
-                    elif recent.chunks:
-                        recent.chunks.clear()
                     now = time.monotonic()
                     self.level.emit(min(100, audioop.rms(mono, 2) // 100))
-                    if recognizer.AcceptWaveform(mono):
-                        result = json.loads(recognizer.Result())
-                        text = result.get("text", "").strip()
-                        if text:
-                            words = result.get("result", [])
-                            clock_origin = now - samples / 16000
-                            start = clock_origin + words[0]["start"] if words else now
-                            end = clock_origin + words[-1]["end"] if words else now
-                            pcm = recent.clip(words[0]["start"], words[-1]["end"]) if words else b""
-                            self.timed_sentence.emit(text, start, end, pcm)
+                    origin = now - samples / 16000
+                    for text, start, end, pcm in recognizer.feed(mono):
+                        self.timed_sentence.emit(text, origin + start, origin + end,
+                                                 pcm if self.record_replay.is_set() else b"")
         except Exception as error:
             self.status.emit(f"监听失败 · {error}")
 
@@ -509,6 +506,7 @@ class Window(Q.QWidget):
         self.calibration = None
         self.server = None
         self.listener = None
+        self.microphone_listener = None
         self.voice_replay = VoiceReplay(self)
         self.overlays = []
         self.prank_overlay = None
@@ -547,14 +545,24 @@ class Window(Q.QWidget):
         self.navigation = Q.QPushButton("设置")
         self.navigation.setProperty("variant", "secondary")
         self.navigation.clicked.connect(self.toggle_settings)
+        self.debug_button = Q.QPushButton("调试模式")
+        self.debug_button.setObjectName("debugToggle")
+        self.debug_button.setProperty("variant", "secondary")
+        self.debug_button.setCheckable(True)
+        self.debug_button.toggled.connect(self.toggle_debug)
+        header.addWidget(self.debug_button)
         header.addWidget(self.navigation)
         self.hide_button = Q.QPushButton("隐藏到托盘")
         self.hide_button.setProperty("variant", "secondary")
         self.hide_button.clicked.connect(self.hide)
         header.addWidget(self.hide_button)
         layout.addLayout(header)
+        content = Q.QHBoxLayout()
+        content.setSpacing(18)
+        layout.addLayout(content, 1)
         self.views = Q.QStackedWidget()
-        layout.addWidget(self.views, 1)
+        content.addWidget(self.views, 1)
+        self.build_debug(content)
         self.build_home()
         self.build_settings()
         self.build_listen()
@@ -637,6 +645,91 @@ class Window(Q.QWidget):
         self.settings_pages.addWidget(page)
         self.settings_list.addItem(label)
         return layout
+
+    def build_debug(self, content):
+        self.debug_panel = Q.QFrame()
+        self.debug_panel.setObjectName("recentCard")
+        self.debug_panel.setFixedWidth(310)
+        layout = Q.QVBoxLayout(self.debug_panel)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+        title = Q.QLabel("监听记录")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+        self.debug_log = Q.QPlainTextEdit()
+        self.debug_log.setReadOnly(True)
+        self.debug_log.setMaximumBlockCount(240)
+        self.debug_log.setPlaceholderText("说完一句话后，这里会显示转写和关键词命中结果。")
+        layout.addWidget(self.debug_log, 1)
+        self.microphone_status = Q.QLabel("麦克风已关闭")
+        self.microphone_status.setObjectName("secondaryText")
+        self.microphone_status.setWordWrap(True)
+        layout.addWidget(self.microphone_status)
+        self.microphone_volume = Q.QProgressBar()
+        self.microphone_volume.setAccessibleName("麦克风输入音量")
+        self.microphone_volume.setTextVisible(False)
+        self.microphone_volume.setFixedHeight(6)
+        self.microphone_volume.setValue(0)
+        layout.addWidget(self.microphone_volume)
+        self.microphone_button, _ = self.button_row(
+            layout, ("开启麦克风", self.toggle_microphone), ("清空", self.debug_log.clear))
+        content.addWidget(self.debug_panel)
+        self.debug_panel.hide()
+
+    def toggle_debug(self, enabled):
+        previous_width = self.width()
+        self.debug_panel.setVisible(enabled)
+        if not self.isMaximized() and self.screen():
+            span = self.debug_panel.width() + 18
+            if enabled:
+                width = min(previous_width + span, self.screen().availableGeometry().width())
+                self.debug_added_width = max(0, width - previous_width)
+                self.resize(width, self.height())
+            else:
+                self.resize(previous_width - getattr(self, "debug_added_width", 0), self.height())
+        if not enabled:
+            self.stop_microphone()
+
+    def toggle_microphone(self):
+        if self.microphone_listener:
+            self.stop_microphone()
+            return
+        if not self.debug_button.isChecked():
+            return
+        model = self.listening_model()
+        if model is None:
+            self.microphone_status.setText(self.missing_model_message())
+            return
+        self.microphone_listener = Listener(None, model, self)
+        self.microphone_listener.level.connect(self.microphone_volume.setValue)
+        self.microphone_listener.status.connect(self.microphone_status.setText)
+        self.microphone_listener.timed_sentence.connect(self.on_microphone_sentence)
+        self.microphone_listener.finished.connect(self.microphone_finished)
+        self.microphone_status.setText("正在加载离线模型…")
+        self.microphone_button.setText("关闭麦克风")
+        self.microphone_listener.start()
+
+    def stop_microphone(self):
+        if self.microphone_listener:
+            self.microphone_listener.stop.set()
+            self.microphone_status.setText("正在关闭麦克风…")
+            self.microphone_button.setEnabled(False)
+
+    def microphone_finished(self):
+        self.microphone_listener.deleteLater()
+        self.microphone_listener = None
+        self.microphone_volume.setValue(0)
+        if not self.microphone_status.text().startswith("监听失败"):
+            self.microphone_status.setText("麦克风已关闭")
+        self.microphone_button.setText("开启麦克风")
+        self.microphone_button.setEnabled(True)
+        if self.quitting and not self.listener:
+            Q.QApplication.quit()
+
+    def on_microphone_sentence(self, text, start, end, pcm):
+        if (self.debug_button.isChecked() and self.microphone_listener
+                and not self.microphone_listener.stop.is_set()):
+            self.on_sentence(text, start, end, pcm, microphone=True)
 
     def build_settings(self):
         self.settings_view = Q.QWidget()
@@ -826,19 +919,20 @@ class Window(Q.QWidget):
         layout.addWidget(self.volume)
         self.transcript = Q.QPlainTextEdit()
         self.transcript.setReadOnly(True)
-        self.transcript.setPlaceholderText("最近一句转写")
+        self.transcript.setPlaceholderText("最近一句原始转写")
         layout.addWidget(self.transcript, 1)
         self.match_label = Q.QLabel("命中关键词 · 无")
         self.match_label.setTextFormat(C.Qt.PlainText)
         layout.addWidget(self.match_label)
-        default = ROOT / "models" / "vosk-model-small-cn-0.22"
-        self.model = Q.QLineEdit(str(self.settings.value("model", str(default))))
-        layout.addWidget(Q.QLabel("本地 Vosk 中文模型目录"))
+        saved = self.settings.value("sensevoice_model", "", type=str)
+        self.model = Q.QLineEdit(saved or str(DEFAULT_MODEL))
+        self.listening_model()
+        layout.addWidget(Q.QLabel("本地 SenseVoice 中英识别模型目录"))
         layout.addWidget(self.model)
         self.button_row(layout, ("选择目录", self.choose_model))
 
     def choose_model(self):
-        path = Q.QFileDialog.getExistingDirectory(self, "选择 Vosk 模型目录")
+        path = Q.QFileDialog.getExistingDirectory(self, "选择 SenseVoice 模型目录")
         if path:
             self.model.setText(path)
 
@@ -848,8 +942,12 @@ class Window(Q.QWidget):
         self.process.blockSignals(True)
         self.process.clear()
         try:
-            processes = [(name, pid) for name, pid in running_processes()
-                         if name and pid and pid != os.getpid()]
+            entries = running_processes()
+            names_by_pid = {pid: name.casefold() for name, pid, _ in entries}
+            processes = [(name, pid) for name, pid, parent in entries
+                         if name and pid and pid != os.getpid()
+                         and names_by_pid.get(parent) != name.casefold()
+                         and name.casefold() not in ("oopz-overlay2.exe", "oopz-runner.exe")]
             priorities = lambda entry: (not any(term in entry[0].casefold()
                                                 for term in ("kook", "kaihei", "oopz")), entry[0].casefold())
             self.process.addItem("选择声音来源", None)
@@ -871,15 +969,34 @@ class Window(Q.QWidget):
             self.process.blockSignals(False)
             self.update_source()
 
+    def listening_model(self):
+        configured = self.model.text().strip()
+        if configured:
+            model = ROOT / configured
+            if all((model / file).is_file() for file in MODEL_FILES):
+                return model
+        if all((DEFAULT_MODEL / file).is_file() for file in MODEL_FILES):
+            self.model.setText(str(DEFAULT_MODEL))
+            return DEFAULT_MODEL
+        return None
+
+    def missing_model_message(self):
+        if (ROOT / "runtime" / "pythonw.exe").is_file():
+            return "找不到随包模型，请完整解压免安装包，并确认 models 文件夹与麦来.exe 同级。"
+        return "SenseVoice 模型未安装完整，请运行「安装依赖和模型.ps1」。"
+
     def start_listen(self):
         if self.listener:
             return
         process = self.process.currentData()
-        model = Path(self.model.text().strip())
-        if not process or not (model / "am" / "final.mdl").is_file():
-            self.set_status("请在设置里选择声音来源和语音模型。")
+        if not process:
+            self.set_status("请先选择声音来源。")
             return
-        self.settings.setValue("model", str(model))
+        model = self.listening_model()
+        if model is None:
+            self.set_status(self.missing_model_message())
+            return
+        self.settings.setValue("sensevoice_model", "" if model == DEFAULT_MODEL else str(model))
         pid, self.source = process
         self.listener = Listener(pid, model, self)
         self.listener.level.connect(self.volume.setValue)
@@ -910,7 +1027,7 @@ class Window(Q.QWidget):
         else:
             status = self.status.text()
         self.set_status(status)
-        if self.quitting:
+        if self.quitting and not self.microphone_listener:
             Q.QApplication.quit()
 
     def set_status(self, text):
@@ -924,19 +1041,29 @@ class Window(Q.QWidget):
         if hasattr(self, "tray"):
             self.tray.setToolTip(f"{BRAND} · {text}")
 
-    def on_sentence(self, text, start=0.0, end=0.0, pcm=b""):
+    def sound_enabled_for(self, word, overrides):
+        return overrides.get(word, word in delta_pack.SOUND_WORDS)
+
+    def on_sentence(self, text, start=0.0, end=0.0, pcm=b"", *, microphone=False):
         text = re.sub(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])", "", text)
-        speaker = self.activity.identify(start, end) if self.kook_nicknames_enabled() else None
-        label = f"{speaker or getattr(self, 'source', '试播')}：{text}"
-        self.transcript.setPlainText(label)
-        folded = "".join(text.casefold().split())
+        original = text
+        speaker = self.activity.identify(start, end) if not microphone and self.kook_nicknames_enabled() else None
+        name = "我（麦克风）" if microphone else speaker or getattr(self, "source", "试播")
+        self.transcript.setPlainText(f"{name}：{text}")
         state = self.store.snapshot()
-        matches = [word for word in state["words"]
-                   if "".join(word.casefold().split()) in folded]
-        call = REPEATED_DIRECTION.fullmatch(re.sub(r"[，。！？、,.!?；;]", "", folded))
-        if call:
-            expanded = call["call"] + "有人"
-            if expanded in state["words"] and expanded not in matches:
+        enabled_words = set(state["words"])
+        overrides = self.settings.value("sound_word_overrides", {}, type=dict)
+        sound_words = {word for word in enabled_words if self.sound_enabled_for(word, overrides)}
+        for short_call in ("左边", "右边"):
+            if short_call not in enabled_words and short_call + "有人" in sound_words:
+                sound_words.add(short_call)
+        text, matches = match_words(text, state["words"], sound_words, DELTA_LATIN_NAMES)
+        label = f"{name}：{text}"
+        directions = {direction(cue.group()) for cue in CUE_PATTERN.finditer(fold(text))}
+        for short_call in ("左边", "右边"):
+            expanded = short_call + "有人"
+            if (expanded in enabled_words and expanded not in matches
+                    and short_call not in matches and direction(short_call) in directions):
                 matches.append(expanded)
         self.match_label.setText("命中关键词 · " + ("、".join(matches) or "无"))
         now = time.monotonic()
@@ -944,6 +1071,8 @@ class Window(Q.QWidget):
         self.burst_hits = {key: [hit for hit in times if hit > threshold]
                            for key, times in self.burst_hits.items() if times[-1] > threshold}
         capped = False
+        cooling = False
+        result = "未命中"
         fun = self.mode.currentData() == "fun"
         preset = self.settings.value("delta_preset", state.get("default_delta", False), type=bool)
         for word in sorted(matches, key=lambda value: (
@@ -955,9 +1084,11 @@ class Window(Q.QWidget):
                     position = "scroll"
                 style = "normal"
             signature = (style, cooldown, glyph, position)
-            cooldown_key = delta_pack.ALIASES.get(word, word) if preset else word
+            canonical = delta_pack.ALIASES.get(word, word) if preset else word
+            cooldown_key = canonical.casefold()
             previous = self.last_hit.get(cooldown_key)
             if previous and previous[0] == signature and now - previous[1] < cooldown:
+                cooling = True
                 continue
             if position == "auto":
                 position = direction(word) or direction(text) or "scroll"
@@ -985,9 +1116,19 @@ class Window(Q.QWidget):
                 played = self.replay_enabled() and self.voice_replay.play(pcm)
                 if fun and self.sound_enabled.isChecked() and not played:
                     self.play_sound()
-                return
-        if capped:
+                result = "已显示弹幕"
+                break
+        if capped and result != "已显示弹幕":
             self.match_label.setText(self.match_label.text() + " · 防刷屏")
+            result = "命中，防刷屏"
+        elif matches and result != "已显示弹幕":
+            result = "命中，冷却中" if cooling else "命中，未显示"
+        if self.debug_button.isChecked():
+            when = datetime.now().strftime("%H:%M:%S")
+            correction = f"\n纠正后 · {text}" if text != original else ""
+            words = "、".join(matches) or "无"
+            self.debug_log.appendPlainText(
+                f"{when} · {name}\n{original}{correction}\n关键词 · {words}    {result}\n")
 
     def repeat_last(self):
         if self.last_line is None:
@@ -1008,12 +1149,12 @@ class Window(Q.QWidget):
         self.word_list.itemDoubleClicked.connect(lambda _: self.rename_word())
         layout.addWidget(self.word_list)
         self.button_row(layout, ("添加或批量粘贴", self.add_words), ("修改", self.rename_word),
-                        ("删除", self.delete_word), ("设定特效和冷却", self.configure_effect))
+                        ("删除", self.delete_word), ("匹配与弹幕设置", self.configure_effect))
         self.button_row(layout, ("导入 TXT", self.import_words), ("导出 TXT", self.export_words))
 
     def build_presets(self):
         layout = self.page("词包与试用")
-        title = Q.QLabel("三角洲行动 · 42 个关键词")
+        title = Q.QLabel(f"三角洲行动 · {len(delta_pack.WORDS)} 条关键词")
         title.setObjectName("sectionText")
         layout.addWidget(title)
         self.button_row(layout, ("添加左右报点规则", self.add_directions))
@@ -1118,18 +1259,25 @@ class Window(Q.QWidget):
         delay.setValue(cooldown)
         character = Q.QLineEdit(glyph)
         character.setMaxLength(1)
+        overrides = self.settings.value("sound_word_overrides", {}, type=dict)
+        sound_match = Q.QCheckBox("用同音和近音转写触发")
+        sound_match.setChecked(self.sound_enabled_for(word, overrides))
         form.addRow("特效", choices)
         form.addRow("出场位置", placement)
         form.addRow("冷却秒数", delay)
         form.addRow("整蛊大字", character)
+        form.addRow("读音匹配", sound_match)
         buttons = Q.QDialogButtonBox(Q.QDialogButtonBox.Save | Q.QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         form.addRow(buttons)
         if dialog.exec_():
-            self.edit_safely(lambda: self.store.effect(
-                word, choices.currentData(), delay.value(), character.text() or "区",
-                position=placement.currentData()))
+            def save():
+                self.store.effect(word, choices.currentData(), delay.value(), character.text() or "区",
+                                  position=placement.currentData())
+                overrides[word] = sound_match.isChecked()
+                self.settings.setValue("sound_word_overrides", overrides)
+            self.edit_safely(save)
 
     def add_words(self):
         text, ok = Q.QInputDialog.getMultiLineText(self, "添加关键词", "一行一个关键词")
@@ -1724,6 +1872,10 @@ class Window(Q.QWidget):
         if not self.has_tray:
             self.quit()
 
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.stop_microphone()
+
     def quit(self):
         self.quitting = True
         self.voice_replay.stop()
@@ -1739,9 +1891,10 @@ class Window(Q.QWidget):
         if self.server:
             self.server.shutdown()
             self.server.server_close()
+        self.stop_microphone()
         if self.listener:
             self.stop_listen()
-        else:
+        elif not self.microphone_listener:
             Q.QApplication.quit()
 
 
