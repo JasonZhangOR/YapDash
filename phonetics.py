@@ -11,6 +11,7 @@ HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 NEAR_INITIALS = {"zh": "z", "ch": "c", "sh": "s", "l": "n"}
 NASALS = {"ang": "an", "eng": "en", "ing": "in", "iang": "ian", "uang": "uan"}
 INITIAL = re.compile(r"^(zh|ch|sh|[bpmfdtnlgkhjqxrzcsyw])")
+NAME_FOLLOWUP = re.compile(r"(?:的)?(?:开[一二三123]?技能|[一二三123]技能|精[一二]|专[一二三]|上场|撤退|封烟|开大|在[ABC]点)", re.I)
 
 
 def fold(text):
@@ -66,7 +67,8 @@ def phonetic_index(words):
     return by_length
 
 
-def match_words(text, words, sound_words, whole_tokens=()):
+def match_words(text, words, sound_words, whole_tokens=(), solo_names=(), transcription_variants=(),
+                reviewed_aliases=()):
     """Return full display text and matching words, including pronunciation corrections."""
     compact = []
     offsets = []
@@ -76,8 +78,12 @@ def match_words(text, words, sound_words, whole_tokens=()):
             compact.append(folded)
             offsets.extend([offset] * len(folded))
     folded = "".join(compact)
-    matches = set()
     exact_spans = set()
+    exact_hits = []
+    single = re.fullmatch(r"[\s，。！？、,.!?；;]*([\u3400-\u4dbf\u4e00-\u9fff])[\s，。！？、,.!?；;]*", text)
+    enabled = {fold(word): word for word in words}
+    aliases = {fold(heard): enabled[fold(word)] for heard, word in reviewed_aliases
+               if fold(word) in enabled}
     for word in words:
         needle = fold(word)
         if not needle:
@@ -87,17 +93,36 @@ def match_words(text, words, sound_words, whole_tokens=()):
             left = offsets[start]
             right = offsets[start + len(needle) - 1] + 1
             neighbors = text[max(0, left - 1):left] + text[right:right + 1]
-            if needle not in whole_tokens or not any(char.isascii() and char.isalnum() for char in neighbors):
-                matches.add(word)
-                exact_spans.update(range(left, right))
+            name_allowed = (word not in solo_names or single or NAME_FOLLOWUP.match(text, right)
+                            or all(not char.isalnum() for char in neighbors))
+            if name_allowed and (needle not in whole_tokens or not any(char.isascii() and char.isalnum() for char in neighbors)):
+                if needle not in aliases:
+                    exact_spans.update(range(left, right))
+                    exact_hits.append((left, right, word))
             start = folded.find(needle, start + 1)
 
     index = phonetic_index(tuple(sorted(sound_words)))
-    if not index:
-        return text, [word for word in words if word in matches]
     candidates = []
-    single = re.fullmatch(r"[\s，。！？、,.!?；;]*([\u3400-\u4dbf\u4e00-\u9fff])[\s，。！？、,.!?；;]*", text)
+    for heard, word in aliases.items():
+        for occurrence in re.finditer(re.escape(heard), folded):
+            start = offsets[occurrence.start()]
+            end = offsets[occurrence.end() - 1] + 1
+            neighbors = text[max(0, start - 1):start] + text[end:end + 1]
+            if heard.isascii() and any(char.isascii() and char.isalnum() for char in neighbors):
+                continue
+            if heard == "锁" and not (single or re.match(r"[了住吧]|[，。！？,.!?]|$", text[end:])):
+                continue
+            if any(left < end and start < right and not (start <= left and right <= end)
+                   for left, right, _ in exact_hits):
+                continue
+            candidates.append((-2, -len(heard), start, end, word))
+    for heard, word in transcription_variants:
+        if word in sound_words:
+            for occurrence in re.finditer(re.escape(heard), text):
+                candidates.append((-1, -len(heard), occurrence.start(), occurrence.end(), word))
     for phrase in HAN.finditer(text):
+        if not index:
+            break
         readings = syllables(phrase.group())
         for size, targets in index.items():
             if size == 1 and not single:
@@ -118,12 +143,16 @@ def match_words(text, words, sound_words, whole_tokens=()):
                     candidates.append((best, -size, start, end, winners[0]))
 
     replacements = {}
-    for _, _, start, end, word in sorted(candidates):
+    replaced = set()
+    for cost, _, start, end, word in sorted(candidates):
         span = range(start, end)
-        if exact_spans.isdisjoint(span):
+        if replaced.isdisjoint(span) and (cost == -2 or exact_spans.isdisjoint(span)):
             replacements[start] = (end, word)
+            replaced.update(span)
             exact_spans.update(span)
-            matches.add(word)
+    matches = {word for left, right, word in exact_hits if replaced.isdisjoint(range(left, right))} | {
+        word for _, word in replacements.values()
+    }
     for start, (end, word) in sorted(replacements.items(), reverse=True):
         text = text[:start] + word + text[end:]
     return text, [word for word in words if word in matches]

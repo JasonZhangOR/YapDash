@@ -22,6 +22,7 @@ from speakers import Activity, distance, fingerprint, is_active
 from replay import VoiceReplay
 from sensevoice import MODEL_DIR, MODEL_FILES, SenseVoice
 import delta_pack
+import game_packs
 from phonetics import fold, match_words
 
 
@@ -38,7 +39,6 @@ DEFAULT_EFFECT = ["normal", 0, "区"]
 CUE_PATTERN = re.compile(r"左手边|左边|左侧|左面|右手边|右边|右侧|右面")
 BURST_WINDOW_SECONDS = 5.0
 MAX_BURST_CAPTIONS = 2
-DELTA_LATIN_NAMES = frozenset(word.casefold() for word in delta_pack.LATIN_NAMES)
 APP_STYLE = """
 QWidget#appWindow {background:#111116}
 QWidget {color:#efedf5}
@@ -188,7 +188,7 @@ class QuickStart(Q.QDialog):
          "回首页点「开始监听」。队友说话时，首页的音量条会动。"),
         ("决定哪些话要上屏",
          f"新词库已经带了 {len(delta_pack.WORDS)} 个三角洲关键词。在「设置 → 关键词」里可以增删或批量粘贴。"
-         "比如只配置「牢赛」，队友说「东楼有牢赛」，上屏的是整句话。"),
+         "可以在下面切换监听用的词库。选择「自动识别游戏」后，麦来会根据正在运行的游戏切换。"),
         ("自己试播一次",
          "下面的按钮可以直接试播整句，当前不用进语音房。娱乐模式下，在游戏里按 "
          "Ctrl+Shift+F8 可以试播大字「区」。纯净模式用普通弹幕显示原句。"),
@@ -217,6 +217,8 @@ class QuickStart(Q.QDialog):
         self.body.setObjectName("guideBody")
         self.body.setWordWrap(True)
         layout.addWidget(self.body)
+        self.game_picker = window.game_library_picker()
+        layout.addWidget(self.game_picker)
         self.preview = Q.QPushButton("试播「东楼有牢赛」")
         self.preview.clicked.connect(lambda: self.window.emit_overlay("试播：东楼有牢赛"))
         layout.addWidget(self.preview, 0, C.Qt.AlignLeft)
@@ -243,6 +245,7 @@ class QuickStart(Q.QDialog):
         self.step.setText(f"快速上手 · {index + 1} / {len(self.STEPS)}")
         self.heading.setText(heading)
         self.body.setText(body)
+        self.game_picker.setVisible(index == 1)
         self.preview.setVisible(index == 2)
         self.previous.setEnabled(index > 0)
         self.next.setText("完成" if index == len(self.STEPS) - 1 else "下一步")
@@ -500,6 +503,8 @@ class Window(Q.QWidget):
         self.setMinimumSize(720, 520)
         self.store = Words(DATA / "words.json")
         self.settings = C.QSettings("ShengMu", "ShengMu")
+        self.detected_game = None
+        self.library_choice = self.settings.value("active_library", "local", type=str)
         self.guide = None
         self.speaker_profiles = json.loads(self.settings.value("speaker_profiles", "{}"))
         self.activity = Activity()
@@ -615,6 +620,10 @@ class Window(Q.QWidget):
         self.prank_help.setText("游戏中按 Ctrl+Shift+F10 可关掉整蛊并清屏。" if self.hotkey_ready
                                 else "快捷键被占用，可在托盘菜单中关闭整蛊并清屏。")
         self.refresh_processes()
+        self.update_game_detection()
+        self.game_timer = C.QTimer(self)
+        self.game_timer.timeout.connect(self.update_game_detection)
+        self.game_timer.start(3000)
         self.refresh_timer = C.QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_words)
         self.refresh_timer.start(350)
@@ -794,6 +803,58 @@ class Window(Q.QWidget):
         if not self.isVisible():
             self.reopen()
 
+    def game_library_picker(self):
+        picker = Q.QComboBox()
+        picker.setAccessibleName("监听词库")
+        picker.addItem("我的词库", "local")
+        picker.addItem("自动识别游戏", "auto")
+        for pack in game_packs.PACKS:
+            picker.addItem(pack.name, pack.name)
+        picker.setCurrentIndex(max(0, picker.findData(self.library_choice)))
+        picker.currentIndexChanged.connect(lambda: self.select_library(picker.currentData()))
+        return picker
+
+    def select_library(self, choice):
+        self.library_choice = choice
+        self.settings.setValue("active_library", choice)
+        pickers = [self.home_library]
+        if self.guide is not None:
+            pickers.append(self.guide.game_picker)
+        for picker in pickers:
+            with C.QSignalBlocker(picker):
+                picker.setCurrentIndex(picker.findData(choice))
+        self.update_game_detection()
+
+    def update_game_detection(self):
+        if self.library_choice == "auto":
+            try:
+                games = {game_packs.PROCESS_GAMES[name.casefold()]
+                         for name, _, _ in running_processes()
+                         if name.casefold() in game_packs.PROCESS_GAMES}
+            except OSError:
+                games = set()
+            self.detected_game = next(iter(games)) if len(games) == 1 else None
+            self.library_status.setText(
+                f"已识别 {self.detected_game.name}" if self.detected_game else
+                "多个游戏运行中，使用我的词库" if games else "未识别游戏，使用我的词库")
+        else:
+            self.update_library_status()
+
+    def update_library_status(self):
+        self.library_status.setText("按游戏进程切换" if self.library_choice == "auto" else "")
+
+    def active_words(self, local_words):
+        pack = (self.detected_game if self.library_choice == "auto" else
+                next((item for item in game_packs.PACKS if item.name == self.library_choice), None))
+        if pack is None:
+            return local_words
+        active = {word.casefold(): word for word in pack.words}
+        for word in local_words:
+            key = word.casefold()
+            if key in active or key not in game_packs.BUILTIN_WORDS:
+                active[key] = word
+        return list(active.values())
+
     def build_home(self):
         home = Q.QWidget()
         content = Q.QVBoxLayout(home)
@@ -842,6 +903,15 @@ class Window(Q.QWidget):
             panel, ("开始监听", self.toggle_listen), ("选择声音来源", self.open_audio_settings))
         self.listen_button.setProperty("variant", "primary")
         source_button.setProperty("variant", "quiet")
+        library_row = Q.QHBoxLayout()
+        library_row.addWidget(Q.QLabel("监听词库"))
+        self.home_library = self.game_library_picker()
+        library_row.addWidget(self.home_library)
+        self.library_status = Q.QLabel()
+        self.library_status.setWordWrap(True)
+        library_row.addWidget(self.library_status, 1)
+        panel.addLayout(library_row)
+        self.update_library_status()
         content.addWidget(connection)
 
         recent = Q.QFrame()
@@ -1042,22 +1112,25 @@ class Window(Q.QWidget):
             self.tray.setToolTip(f"{BRAND} · {text}")
 
     def sound_enabled_for(self, word, overrides):
-        return overrides.get(word, word in delta_pack.SOUND_WORDS)
+        return overrides.get(word, word in game_packs.SOUND_WORDS)
 
-    def on_sentence(self, text, start=0.0, end=0.0, pcm=b"", *, microphone=False):
+    def on_sentence(self, text, start=0.0, end=0.0, pcm=b"", *, microphone=False, preview_pack=None):
         text = re.sub(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])", "", text)
         original = text
         speaker = self.activity.identify(start, end) if not microphone and self.kook_nicknames_enabled() else None
         name = "我（麦克风）" if microphone else speaker or getattr(self, "source", "试播")
         self.transcript.setPlainText(f"{name}：{text}")
         state = self.store.snapshot()
-        enabled_words = set(state["words"])
+        words = preview_pack.words if preview_pack else self.active_words(state["words"])
+        enabled_words = set(words)
         overrides = self.settings.value("sound_word_overrides", {}, type=dict)
         sound_words = {word for word in enabled_words if self.sound_enabled_for(word, overrides)}
         for short_call in ("左边", "右边"):
             if short_call not in enabled_words and short_call + "有人" in sound_words:
                 sound_words.add(short_call)
-        text, matches = match_words(text, state["words"], sound_words, DELTA_LATIN_NAMES)
+        text, matches = match_words(text, words, sound_words, game_packs.LATIN_WORDS,
+                                   game_packs.SOLO_NAMES, game_packs.TRANSCRIPTION_VARIANTS,
+                                   game_packs.REVIEWED_ALIASES)
         label = f"{name}：{text}"
         directions = {direction(cue.group()) for cue in CUE_PATTERN.finditer(fold(text))}
         for short_call in ("左边", "右边"):
@@ -1154,28 +1227,38 @@ class Window(Q.QWidget):
 
     def build_presets(self):
         layout = self.page("词包与试用")
-        title = Q.QLabel(f"三角洲行动 · {len(delta_pack.WORDS)} 条关键词")
-        title.setObjectName("sectionText")
-        layout.addWidget(title)
+        layout.addWidget(Q.QLabel("选择要加入本机词库的游戏或玩法"))
+        self.pack_picker = Q.QComboBox()
+        self.pack_picker.setAccessibleName("游戏词包")
+        for item in game_packs.PACKS:
+            self.pack_picker.addItem(f"{item.name} · {len(item.words)} 条")
+        layout.addWidget(self.pack_picker)
+        _, preview = self.button_row(layout, ("合并到我的词库", self.load_game_pack),
+                                     ("试播", self.preview_game_pack))
+        def show_example(index):
+            preview.setText(f"试播「{game_packs.PACKS[index].example}」")
+            self.preset_status.clear()
         self.button_row(layout, ("添加左右报点规则", self.add_directions))
-        self.button_row(layout, ("加载三角洲词包", self.load_delta_pack),
-                        ("试播「东楼有牢赛」", self.preview_delta))
         self.preset_status = Q.QLabel()
+        self.preset_status.setWordWrap(True)
         layout.addWidget(self.preset_status)
+        self.pack_picker.currentIndexChanged.connect(show_example)
+        show_example(0)
         layout.addStretch(1)
 
-    def load_delta_pack(self):
+    def load_game_pack(self):
+        item = game_packs.PACKS[self.pack_picker.currentIndex()]
         def load():
-            added = self.store.add_preset(delta_pack.WORDS, delta_pack.EFFECTS)
-            self.settings.setValue("delta_preset", True)
-            self.preset_status.setText(f"三角洲词包已加载 · 新增 {added} 个词")
+            effects = delta_pack.EFFECTS if item is game_packs.DELTA else {}
+            added = self.store.add_preset(item.words, effects)
+            if item is game_packs.DELTA:
+                self.settings.setValue("delta_preset", True)
+            self.preset_status.setText(f"{item.name}已合并 · 新增 {added} 条")
         self.edit_safely(load)
 
-    def preview_delta(self):
-        if "牢赛" not in self.store.snapshot()["words"]:
-            self.preset_status.setText("先加载三角洲词包，再试播整句。")
-            return
-        self.on_sentence("东楼有牢赛")
+    def preview_game_pack(self):
+        item = game_packs.PACKS[self.pack_picker.currentIndex()]
+        self.on_sentence(item.example, preview_pack=item)
 
     def add_directions(self):
         def add():
